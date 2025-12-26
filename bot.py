@@ -18,11 +18,42 @@ logger = logging.getLogger(__name__)
 # Загрузка списка разрешенных пользователей
 ALLOWED_USER_IDS = list(map(int, os.getenv('ALLOWED_USER_IDS', '').split(','))) if os.getenv('ALLOWED_USER_IDS') else []
 
-# Проверка конфигурации белого списка
+# Загрузка прав доступа пользователей к серверам
+def load_user_access():
+    """Загружает права доступа пользователей к серверам"""
+    user_access = {}
+    access_config = os.getenv('USER_ACCESS', '')
+    
+    if not access_config:
+        return user_access
+    
+    try:
+        # Разбираем конфигурацию формата "USER_ID:SERVER_1,SERVER_2;USER_ID:SERVER_1"
+        user_entries = access_config.split(';')
+        for entry in user_entries:
+            if ':' in entry:
+                user_id_str, servers_str = entry.split(':', 1)
+                user_id = int(user_id_str.strip())
+                servers = [server.strip() for server in servers_str.split(',')]
+                user_access[user_id] = servers
+    except Exception as e:
+        logger.error(f"Ошибка загрузки прав доступа: {e}")
+    
+    return user_access
+
+# Загружаем права доступа
+USER_ACCESS = load_user_access()
+
+# Проверка конфигурации
 if not ALLOWED_USER_IDS:
     print("❌ ВНИМАНИЕ: ALLOWED_USER_IDS не настроен. Доступ открыт для всех!")
 else:
     print(f"✅ Белый список пользователей: {len(ALLOWED_USER_IDS)} пользователей")
+
+if USER_ACCESS:
+    print(f"✅ Загружены права доступа для {len(USER_ACCESS)} пользователей")
+else:
+    print("ℹ️  Права доступа к серверам не настроены")
 
 # Загрузка конфигурации серверов
 def load_servers_config():
@@ -111,6 +142,26 @@ def check_access(user_id):
         return True
     return user_id in ALLOWED_USER_IDS
 
+# Функция проверки доступа к серверу
+def check_server_access(user_id, server_id):
+    """Проверяет, есть ли у пользователя доступ к конкретному серверу"""
+    # Если права доступа не настроены - доступ ко всем серверам
+    if not USER_ACCESS:
+        return True
+    
+    # Если пользователь есть в списке прав доступа
+    if user_id in USER_ACCESS:
+        # Если список серверов пустой или содержит '*' - доступ ко всем серверам
+        user_servers = USER_ACCESS[user_id]
+        if not user_servers or '*' in user_servers:
+            return True
+        # Проверяем доступ к конкретному серверу
+        return server_id in user_servers
+    
+    # Если пользователя нет в списке прав доступа - доступ только если нет ограничений для других пользователей
+    # Это позволяет сохранить обратную совместимость
+    return len(USER_ACCESS) == 0
+
 # Декораторы для проверки доступа
 def access_check_message(func):
     def wrapper(message):
@@ -127,6 +178,65 @@ def access_check_callback(func):
             return
         return func(call)
     return wrapper
+
+# Декоратор для проверки доступа к серверу
+def server_access_check_callback(func):
+    def wrapper(call):
+        # Извлекаем server_id из callback data
+        server_id = None
+        if call.data.startswith('select_server:'):
+            server_id = call.data.replace('select_server:', '', 1)
+        elif call.data.startswith('computers_page:'):
+            parts = call.data.replace('computers_page:', '', 1).split(':')
+            if len(parts) == 2:
+                server_id = parts[0]
+        elif call.data.startswith('select_pc:'):
+            parts = call.data.replace('select_pc:', '', 1).split(':')
+            if len(parts) == 2:
+                server_id = parts[0]
+        elif call.data.startswith('update_normal:'):
+            parts = call.data.replace('update_normal:', '', 1).split(':')
+            if len(parts) == 2:
+                server_id = parts[0]
+        elif call.data.startswith('update_force_confirm:'):
+            parts = call.data.replace('update_force_confirm:', '', 1).split(':')
+            if len(parts) == 2:
+                server_id = parts[0]
+        elif call.data.startswith('force_update:'):
+            parts = call.data.replace('force_update:', '', 1).split(':')
+            if len(parts) == 2:
+                server_id = parts[0]
+        elif call.data.startswith('back_to_mode:'):
+            parts = call.data.replace('back_to_mode:', '', 1).split(':')
+            if len(parts) == 2:
+                server_id = parts[0]
+        elif call.data.startswith('back_to_computers:'):
+            server_id = call.data.replace('back_to_computers:', '', 1)
+        elif call.data.startswith('update_server:'):
+            server_id = call.data.replace('update_server:', '', 1)
+        
+        # Если server_id найден и у пользователя нет доступа
+        if server_id and not check_server_access(call.from_user.id, server_id):
+            bot.answer_callback_query(call.id, "❌ Доступ к этому серверу запрещен", show_alert=True)
+            return
+        
+        return func(call)
+    return wrapper
+
+# Функция для получения списка доступных серверов для пользователя
+def get_available_servers(user_id):
+    """Возвращает список серверов, доступных пользователю"""
+    if not USER_ACCESS:
+        return SERVERS_CONFIG
+    
+    if user_id in USER_ACCESS:
+        user_servers = USER_ACCESS[user_id]
+        if not user_servers or '*' in user_servers:
+            return SERVERS_CONFIG
+        return {server_id: config for server_id, config in SERVERS_CONFIG.items() if server_id in user_servers}
+    
+    # Если пользователя нет в списке прав доступа
+    return {}
 
 # Функция для преобразования номера компьютера в IP адрес
 def number_to_ip(server_config, pc_number):
@@ -236,9 +346,9 @@ def start_update_in_thread(chat_id, server_id, pc_number=None, force=False):
                 return
             
             if force:
-                command = f"sudo ./fre.sh --force {ip_address}"
+                command = f"sudo bash ./fre.sh --force {ip_address}"
             else:
-                command = f"sudo ./fre.sh {ip_address}"
+                command = f"sudo bash ./fre.sh {ip_address}"
             
             success, output = run_ssh_command(server_config, command)
             
@@ -255,7 +365,7 @@ def start_update_in_thread(chat_id, server_id, pc_number=None, force=False):
                 )
         else:
             # Массовое обновление сервера
-            command = "sudo ./fre.sh --all"
+            command = "sudo bash ./fre.sh --all"
             success, output = run_ssh_command(server_config, command)
             
             if success:
@@ -354,9 +464,12 @@ def show_force_confirmation(chat_id, server_id, pc_number, message_id):
 @bot.message_handler(commands=['start', 'help'])
 @access_check_message
 def send_welcome(message):
-    print(f"👤 Пользователь {message.from_user.id} ({message.from_user.first_name}) запустил бота")
+    user_id = message.from_user.id
+    print(f"👤 Пользователь {user_id} ({message.from_user.first_name}) запустил бота")
     
-    total_computers = sum(server['computers_count'] for server in SERVERS_CONFIG.values())
+    # Получаем доступные серверы для пользователя
+    available_servers = get_available_servers(user_id)
+    total_computers = sum(server['computers_count'] for server in available_servers.values())
     
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     buttons = [
@@ -368,16 +481,20 @@ def send_welcome(message):
     
     # Создаем информацию о серверах для отображения (без портов)
     servers_info = ""
-    for server_id, config in list(SERVERS_CONFIG.items())[:3]:
+    for server_id, config in list(available_servers.items())[:3]:
         servers_info += f"• {config['name']}\n"
     
-    if len(SERVERS_CONFIG) > 3:
-        servers_info += f"• ... и еще {len(SERVERS_CONFIG) - 3} серверов\n"
+    if len(available_servers) > 3:
+        servers_info += f"• ... и еще {len(available_servers) - 3} серверов\n"
+    
+    # Если у пользователя нет доступа ни к одному серверу
+    if not available_servers:
+        servers_info = "• ❌ Нет доступных серверов\n"
     
     bot.send_message(
         message.chat.id,
         f"🤖 **Бот управления TrueNAS серверами**\n\n"
-        f"Серверов: {len(SERVERS_CONFIG)}\n"
+        f"Серверов: {len(available_servers)}\n"
         f"Компьютеров: {total_computers}\n\n"
         f"{servers_info}",
         reply_markup=markup,
@@ -398,7 +515,19 @@ def show_my_id(message):
 # Функции меню
 def send_servers_menu(chat_id, page=0, edit_message_id=None):
     """Отправляет меню выбора сервера"""
-    servers_list = list(SERVERS_CONFIG.items())
+    user_id = chat_id
+    available_servers = get_available_servers(user_id)
+    
+    # Если нет доступных серверов
+    if not available_servers:
+        text = "❌ **Нет доступных серверов**\n\nОбратитесь к администратору для получения доступа."
+        if edit_message_id:
+            bot.edit_message_text(text, chat_id, edit_message_id, parse_mode='Markdown')
+        else:
+            bot.send_message(chat_id, text, parse_mode='Markdown')
+        return
+    
+    servers_list = list(available_servers.items())
     servers_per_page = 6
     total_pages = math.ceil(len(servers_list) / servers_per_page)
     
@@ -439,6 +568,15 @@ def send_servers_menu(chat_id, page=0, edit_message_id=None):
 
 def send_computers_menu(chat_id, server_id, page=0, edit_message_id=None):
     """Отправляет меню компьютеров для выбранного сервера"""
+    # Проверяем доступ к серверу
+    if not check_server_access(chat_id, server_id):
+        text = "❌ **Доступ запрещен**\n\nУ вас нет доступа к этому серверу."
+        if edit_message_id:
+            bot.edit_message_text(text, chat_id, edit_message_id, parse_mode='Markdown')
+        else:
+            bot.send_message(chat_id, text, parse_mode='Markdown')
+        return
+    
     server_config = SERVERS_CONFIG[server_id]
     total_computers = server_config['computers_count']
     
@@ -497,9 +635,12 @@ def show_servers_menu(message):
 @bot.message_handler(func=lambda message: message.text == '📊 Статус всех серверов')
 @access_check_message
 def show_global_status(message):
+    user_id = message.from_user.id
+    available_servers = get_available_servers(user_id)
+    
     status_text = "📊 **Статус всех серверов**\n\n"
     
-    for server_id, config in SERVERS_CONFIG.items():
+    for server_id, config in available_servers.items():
         # Упрощенная проверка доступности сервера
         try:
             test_command = "echo 'test'"
@@ -515,12 +656,17 @@ def show_global_status(message):
         status_text += f"   Статус: {status_text_online}\n"
         status_text += f"   Расположение: {config['location']}\n\n"
     
+    if not available_servers:
+        status_text += "❌ Нет доступных серверов"
+    
     bot.send_message(message.chat.id, status_text, parse_mode='Markdown')
 
 @bot.message_handler(func=lambda message: message.text == '❓ Помощь')
 @access_check_message
 def show_help(message):
-    total_computers = sum(server['computers_count'] for server in SERVERS_CONFIG.values())
+    user_id = message.from_user.id
+    available_servers = get_available_servers(user_id)
+    total_computers = sum(server['computers_count'] for server in available_servers.values())
     
     help_text = (
         f"❓ **Помощь по боту**\n\n"
@@ -544,6 +690,8 @@ def show_help(message):
         f"*Результаты выполнения:*\n"
         f"- Результат обновления отправляется сообщением\n"
         f"- Если текста много - отправляется файлом\n\n"
+        f"*Доступные серверы:* {len(available_servers)}\n"
+        f"*Доступные компьютеры:* {total_computers}\n"
     )
     
     bot.send_message(message.chat.id, help_text, parse_mode='Markdown')
@@ -551,6 +699,7 @@ def show_help(message):
 # Обработчики callback'ов
 @bot.callback_query_handler(func=lambda call: True)
 @access_check_callback
+@server_access_check_callback
 def handle_callback(call):
     user_id = call.message.chat.id
     message_id = call.message.message_id
@@ -679,9 +828,15 @@ if __name__ == "__main__":
     print(f"📊 Серверов: {len(SERVERS_CONFIG)}")
     print(f"🔧 Компьютеров на странице: {COMPUTERS_PER_PAGE}")
     print("🔐 Используется аутентификация по паролю")
-    print("🔄 Скрипт обновления: sudo ./fre.sh")
+    print("🔄 Скрипт обновления: sudo bash ./fre.sh")
     print("📄 Большие выводы отправляются как .txt файлы")
     print("👤 Система белого списка активна")
+    
+    if USER_ACCESS:
+        print(f"🔒 Контроль доступа к серверам: настроен для {len(USER_ACCESS)} пользователей")
+    else:
+        print("🔓 Контроль доступа к серверам: не настроен")
+    
     print("Для остановки нажмите Ctrl+C")
     
     try:
